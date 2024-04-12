@@ -1,44 +1,42 @@
 use dotenv::dotenv;
+use poise::{Framework, FrameworkOptions};
 use reqwest::Client as HttpClient;
-use serenity::client::Context;
+use serenity::all::VoiceState;
+use serenity::client::Context as SerenityContext;
 use serenity::{
     async_trait,
     client::{Client, EventHandler},
-    framework::{
-        standard::{
-            macros::{command, group},
-            Args, CommandResult, Configuration,
-        },
-        StandardFramework,
-    },
-    model::{channel::Message, gateway::Ready},
-    prelude::{GatewayIntents, TypeMapKey},
+    model::gateway::Ready,
+    prelude::GatewayIntents,
 };
-use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler, TrackEvent};
-use songbird::input::YoutubeDl;
+use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
 use songbird::SerenityInit;
+use std::collections::HashMap;
 use std::env;
-use utils::check_msg;
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
 
+mod annoy_handlers;
+mod commands;
 mod utils;
-struct HttpKey;
-
-impl TypeMapKey for HttpKey {
-    type Value = HttpClient;
-}
 
 struct Handler;
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn ready(&self, _: Context, ready: Ready) {
+    async fn ready(&self, _: SerenityContext, ready: Ready) {
         println!("{} is connected!", ready.user.name);
     }
-}
 
-#[group]
-#[commands(join, leave, mute, play, ping, undeafen, unmute)]
-struct General;
+    async fn voice_state_update(
+        &self,
+        ctx: SerenityContext,
+        old: Option<VoiceState>,
+        new: VoiceState,
+    ) {
+        annoy_handlers::voice_state_update(ctx, old, new).await;
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -48,66 +46,38 @@ async fn main() {
     // Configure the client with your Discord bot token in the environment.
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
 
-    let framework = StandardFramework::new().group(&GENERAL_GROUP);
-    framework.configure(Configuration::new().prefix("~"));
+    let intents = GatewayIntents::non_privileged()
+        | GatewayIntents::MESSAGE_CONTENT
+        | GatewayIntents::GUILD_VOICE_STATES
+        | GatewayIntents::GUILDS;
 
-    let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
+    let framework = Framework::builder()
+        .options(FrameworkOptions {
+            commands: commands::get_commands(),
+            ..Default::default()
+        })
+        .setup(|ctx, _ready, framework| {
+            Box::pin(async move {
+                poise::builtins::register_globally(ctx, &framework.options().commands).await?;
+                Ok(utils::Data {
+                    client: HttpClient::default(),
+                    songs: Arc::new(Mutex::new(HashMap::new())),
+                    annoy: Arc::new(RwLock::new(HashMap::new())),
+                })
+            })
+        })
+        .build();
 
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler)
         .framework(framework)
+        .event_handler(Handler)
         .register_songbird()
-        // We insert our own HTTP client here to make use of in
-        // `~play`. If we wanted, we could supply cookies and auth
-        // details ahead of time.
-        //
-        // Generally, we don't want to make a new Client for every request!
-        .type_map_insert::<HttpKey>(HttpClient::new())
         .await
         .expect("Err creating client");
 
-    tokio::spawn(async move {
-        let _ = client
-            .start()
-            .await
-            .map_err(|why| println!("Client ended: {:?}", why));
-    });
-}
-
-#[command]
-#[only_in(guilds)]
-async fn join(ctx: &Context, msg: &Message) -> CommandResult {
-    let (guild_id, channel_id) = {
-        let guild = msg.guild(&ctx.cache).unwrap();
-        let channel_id = guild
-            .voice_states
-            .get(&msg.author.id)
-            .and_then(|voice_state| voice_state.channel_id);
-
-        (guild.id, channel_id)
-    };
-
-    let connect_to = match channel_id {
-        Some(channel) => channel,
-        None => {
-            check_msg(msg.reply(ctx, "Not in a voice channel").await);
-
-            return Ok(());
-        }
-    };
-
-    let manager = songbird::get(ctx)
-        .await
-        .expect("Songbird Voice client placed in at initialisation.")
-        .clone();
-
-    if let Ok(handler_lock) = manager.join(guild_id, connect_to).await {
-        // Attach an event handler to see notifications of all track errors.
-        let mut handler = handler_lock.lock().await;
-        handler.add_global_event(TrackEvent::Error.into(), TrackErrorNotifier);
+    if let Err(why) = client.start().await {
+        println!("An error occurred while running the client: {:?}", why);
     }
-
-    Ok(())
 }
 
 struct TrackErrorNotifier;
@@ -127,86 +97,4 @@ impl VoiceEventHandler for TrackErrorNotifier {
 
         None
     }
-}
-
-#[command]
-#[only_in(guilds)]
-async fn leave(ctx: &Context, msg: &Message) -> CommandResult {
-    let guild_id = msg.guild_id.unwrap();
-
-    let manager = songbird::get(ctx)
-        .await
-        .expect("Songbird Voice client placed in at initialisation.")
-        .clone();
-    let has_handler = manager.get(guild_id).is_some();
-
-    if has_handler {
-        if let Err(e) = manager.remove(guild_id).await {
-            check_msg(
-                msg.channel_id
-                    .say(&ctx.http, format!("Failed: {:?}", e))
-                    .await,
-            );
-        }
-
-        check_msg(msg.channel_id.say(&ctx.http, "Left voice channel").await);
-    } else {
-        check_msg(msg.reply(ctx, "Not in a voice channel").await);
-    }
-
-    Ok(())
-}
-
-#[command]
-#[only_in(guilds)]
-async fn play(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
-    let url = match args.single::<String>() {
-        Ok(url) => url,
-        Err(_) => {
-            check_msg(
-                msg.channel_id
-                    .say(&ctx.http, "Must provide a URL to a video or audio")
-                    .await,
-            );
-
-            return Ok(());
-        }
-    };
-
-    let do_search = !url.starts_with("http");
-
-    let guild_id = msg.guild_id.unwrap();
-
-    let http_client = {
-        let data = ctx.data.read().await;
-        data.get::<HttpKey>()
-            .cloned()
-            .expect("Guaranteed to exist in the typemap.")
-    };
-
-    let manager = songbird::get(ctx)
-        .await
-        .expect("Songbird Voice client placed in at initialisation.")
-        .clone();
-
-    if let Some(handler_lock) = manager.get(guild_id) {
-        let mut handler = handler_lock.lock().await;
-
-        let mut src = if do_search {
-            YoutubeDl::new_search(http_client, url)
-        } else {
-            YoutubeDl::new(http_client, url)
-        };
-        let _ = handler.play_input(src.clone().into());
-
-        check_msg(msg.channel_id.say(&ctx.http, "Playing song").await);
-    } else {
-        check_msg(
-            msg.channel_id
-                .say(&ctx.http, "Not in a voice channel to play in")
-                .await,
-        );
-    }
-
-    Ok(())
 }
